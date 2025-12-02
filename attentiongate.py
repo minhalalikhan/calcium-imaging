@@ -9,8 +9,6 @@ import tifffile
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import math
-from scipy.stats import pearsonr
-
 
 from custom_loss import SSIM_MSE_Loss
 
@@ -72,6 +70,143 @@ class PositionalEmbedding(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
+
+
+
+# Attention Gate module
+class AttentionGate(nn.Module):
+    def __init__(self, g_channels, x_channels, inter_channels):
+        super().__init__()
+        self.g_conv = nn.Conv2d(g_channels, inter_channels, kernel_size=1)
+        self.x_conv = nn.Conv2d(x_channels, inter_channels, kernel_size=1)
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, g, x):
+        g1 = self.g_conv(g)
+        x1 = self.x_conv(x)
+        combined = self.relu(g1 + x1)
+        attention = self.psi(combined)
+        return x * attention
+
+# Self-Attention module
+class SelfAttention(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.in_dim = in_dim
+        self.query_conv = nn.Conv2d(in_dim, in_dim // 8, 1)
+        self.key_conv = nn.Conv2d(in_dim, in_dim // 8, 1)
+        self.value_conv = nn.Conv2d(in_dim, in_dim, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        batch_size, C, H, W = x.size()
+        proj_query = self.query_conv(x).view(batch_size, -1, W*H).permute(0, 2, 1)
+        proj_key = self.key_conv(x).view(batch_size, -1, W*H)
+        energy = torch.bmm(proj_query, proj_key)
+        attention = self.softmax(energy)
+        proj_value = self.value_conv(x).view(batch_size, -1, W*H)
+
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, H, W)
+
+        # Add residual connection
+        out = self.gamma * out + x
+        return out
+
+# Modified ConditionalUNet with attention
+class ConditionalUNet_Attention(nn.Module):
+    def __init__(self, in_channels=2, out_channels=1, time_dim=256):
+        super().__init__()
+        self.time_dim = time_dim
+
+        # Time embedding
+        self.time_embed = nn.Sequential(
+            PositionalEmbedding(time_dim),
+            nn.Linear(time_dim, time_dim),
+            nn.ReLU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        # Encoder with attention gates
+        self.enc1 = self._conv_block(in_channels, 64)
+        self.enc2 = self._conv_block(64, 128)
+        self.enc3 = self._conv_block(128, 256)
+
+        # Self-attention at bottleneck
+        self.self_attn = SelfAttention(512)
+
+        # Bottleneck
+        self.bottleneck = self._conv_block(256, 512)
+
+        # Decoder with attention gates
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec3 = self._conv_block(512 + 256, 256)
+        self.att_gate3 = AttentionGate(g_channels=512, x_channels=256, inter_channels=128)
+
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec2 = self._conv_block(256 + 128, 128)
+        self.att_gate2 = AttentionGate(g_channels=256, x_channels=128, inter_channels=64)
+
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec1 = self._conv_block(128 + 64, 64)
+
+        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+
+        # Pooling
+        self.pool = nn.MaxPool2d(2)
+
+    def _conv_block(self, in_ch, out_ch):
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x, t):
+        # Time embedding
+        t_emb = self.time_embed(t)
+        t_emb = t_emb.view(t_emb.shape[0], t_emb.shape[1], 1, 1)
+
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+
+        # Self-attention at bottleneck
+        b = self.bottleneck(self.pool(e3))
+        b = self.self_attn(b)
+
+        # Decoder with attention gating
+        d3 = self.up3(b)
+        g3 = self.att_gate3(d3, e3)
+        d3 = torch.cat([d3, g3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        g2 = self.att_gate2(d2, e2)
+        d2 = torch.cat([d2, g2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        return self.out_conv(d1)
+
+# Usage
+# Instantiate your model:
+# model = ConditionalUNet_Attention().to(device)
+
+# Ensure to modify the training loop accordingly.
+
 
 class ConditionalUNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1, time_dim=256):
@@ -424,7 +559,7 @@ def train(high_snr_path, low_snr_path, train_percent=0.3, crop_box=None,
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     # Initialize model, diffusion process, and optimizer
-    model = ConditionalUNet(in_channels=2, out_channels=1).to(device)
+    model = ConditionalUNet_Attention(in_channels=2, out_channels=1).to(device)
     diffusion = ConditionalDiffusion()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     # loss_fn = nn.MSELoss()
@@ -627,7 +762,7 @@ def test(high_snr_path, low_snr_path, model_path, train_percent=0.3,
     
     # Load model
     checkpoint = torch.load(model_path, map_location=device)
-    model = ConditionalUNet(in_channels=2, out_channels=1).to(device)
+    model = ConditionalUNet_Attention(in_channels=2, out_channels=1).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     # Initialize diffusion
@@ -650,13 +785,6 @@ def test(high_snr_path, low_snr_path, model_path, train_percent=0.3,
             high_np = high_frame.squeeze().cpu().numpy()
             denoised_np = denoised.squeeze().cpu().numpy()
             
-              # Calculate metrics
-            mse = np.mean((denoised_np - high_np) ** 2)
-            psnr = 20 * np.log10(1.0 / np.sqrt(mse)) if mse > 0 else float('inf')
-            
-            # For Pearson correlation, flatten and compute
-            pearson_corr, _ = pearsonr(denoised_np.flatten(), high_np.flatten()) 
-
             # Create comparison plot
             fig, axes = plt.subplots(1, 4, figsize=(16, 4))
             
@@ -677,11 +805,8 @@ def test(high_snr_path, low_snr_path, model_path, train_percent=0.3,
             axes[3].imshow(diff, cmap='hot')
             axes[3].set_title('Absolute Difference')
             axes[3].axis('off')
-
-             # Add Pearson correlation and PSNR text on the figure
-            fig.suptitle(f"Frame {idx}: Pearson Corr = {pearson_corr:.4f}, PSNR = {psnr:.2f} dB", fontsize=14)
             
-            plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for suptitle
+            plt.tight_layout()
             plt.savefig(f'{version_folder}/{output_folder}/comparison_frame_{idx:04d}.png', dpi=150, bbox_inches='tight')
             plt.close()
             
@@ -710,14 +835,15 @@ if __name__ == "__main__":
     # Train the model
     print("Starting training...")
     train(high_snr_path, low_snr_path, 
-          train_percent=0.8, 
+          train_percent=0.7, 
           crop_box=crop_box,
           epochs=50, 
           batch_size=8,
-          learning_rate=1e-4,
+          learning_rate=1e-5,
           append=False)
 
     version_ = get_last_version()
+    # version_=0
     version_folder = f'version{version_}'
     # Test the model
     print("Starting testing...")
