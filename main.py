@@ -50,8 +50,17 @@ class PairedCalciumDataset(Dataset):
         low_frame = self.low_frames[idx].astype(np.float32)
         
         # Normalize to [0, 1]
-        high_frame = (high_frame - high_frame.min()) / (high_frame.max() - high_frame.min() + 1e-8)
-        low_frame = (low_frame - low_frame.min()) / (low_frame.max() - low_frame.min() + 1e-8)
+        # high_frame = (high_frame - high_frame.min()) / (high_frame.max() - high_frame.min() + 1e-8)
+        # low_frame = (low_frame - low_frame.min()) / (low_frame.max() - low_frame.min() + 1e-8)
+        # 🚨 JOINT NORMALIZATION - CRITICAL for Pearson correlation
+        # all_data = np.stack([high_frame, low_frame])
+        # all_min, all_max = all_data.min(), all_data.max()
+        # high_frame = (high_frame - all_min) / (all_max - all_min + 1e-8)
+        # low_frame = (low_frame - all_min) / (all_max - all_min + 1e-8)
+        frame_min = min(high_frame.min(), low_frame.min())
+        frame_max = max(high_frame.max(), low_frame.max())
+        high_frame = (high_frame - frame_min) / (frame_max - frame_min + 1e-8)
+        low_frame = (low_frame - frame_min) / (frame_max - frame_min + 1e-8)
         
         # Add channel dimension
         high_frame = np.expand_dims(high_frame, axis=0)
@@ -118,7 +127,8 @@ class ConditionalUNet(nn.Module):
     
     def forward(self, x, t):
         # Time embedding
-        t_emb = self.time_embed(t)
+        # t_emb = self.time_embed(t)
+        t_emb = self.time_embed(t.long())
         
         # Encoder
         e1 = self.enc1(x)
@@ -380,6 +390,17 @@ def get_prev_model_data():
 
     return last_version,prev_model,prev_epoch,prev_losses    
 
+def pearson_loss(pred, target):
+    """Pearson correlation loss (1 - correlation)"""
+    pred_flat = pred.view(pred.shape[0], -1)
+    target_flat = target.view(target.shape[0], -1)
+    centered_pred = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    centered_target = target_flat - target_flat.mean(dim=1, keepdim=True)
+    corr = (centered_pred * centered_target).sum(dim=1) / \
+           (centered_pred.norm(dim=1) * centered_target.norm(dim=1) + 1e-8)
+    return 1 - corr.mean()  # 0 = perfect correlation
+
+
 
 
 def train(high_snr_path, low_snr_path, train_percent=0.3, crop_box=None, 
@@ -425,7 +446,7 @@ def train(high_snr_path, low_snr_path, train_percent=0.3, crop_box=None,
     
     # Initialize model, diffusion process, and optimizer
     model = ConditionalUNet(in_channels=2, out_channels=1).to(device)
-    diffusion = ConditionalDiffusion()
+    diffusion = ConditionalDiffusion(beta_end=0.01)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     # loss_fn = nn.MSELoss()
     loss_fn = SSIM_MSE_Loss(alpha=0.2)
@@ -512,7 +533,10 @@ def train(high_snr_path, low_snr_path, train_percent=0.3, crop_box=None,
             predicted_noise = model(model_input, t)
             
             # Calculate loss
-            loss = loss_fn(predicted_noise, noise)
+            # loss = loss_fn(predicted_noise, noise)
+            pixel_loss = loss_fn(predicted_noise, noise)
+            pattern_loss = pearson_loss(noisy_batch, high_batch)
+            loss = 0.7 * pixel_loss + 0.3 * pattern_loss
             
             # Backward pass
             optimizer.zero_grad()
@@ -630,6 +654,7 @@ def test(high_snr_path, low_snr_path, model_path, train_percent=0.3,
     model = ConditionalUNet(in_channels=2, out_channels=1).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     
+
     # Initialize diffusion
     diffusion_params = checkpoint['diffusion_params']
     diffusion = ConditionalDiffusion(**diffusion_params)
@@ -642,6 +667,9 @@ def test(high_snr_path, low_snr_path, model_path, train_percent=0.3,
             low_frame = low_frame.unsqueeze(0).to(device)
             high_frame = high_frame.unsqueeze(0).to(device)
             
+            raw_corr, _ = pearsonr(low_frame.squeeze().cpu().numpy().flatten(), 
+                       high_frame.squeeze().cpu().numpy().flatten())
+            print(f"RAW low-high Pearson (pre-model): {raw_corr:.4f}")
             # Denoise using diffusion model
             denoised = diffusion.sample(model, low_frame, device)
             
@@ -697,6 +725,11 @@ def test(high_snr_path, low_snr_path, model_path, train_percent=0.3,
     
     print(f"Testing completed! Results saved in {version_folder}{output_folder}/")
 
+
+
+
+
+
 # Example usage
 if __name__ == "__main__":
     # File paths (update these with your actual file paths)
@@ -712,9 +745,9 @@ if __name__ == "__main__":
     train(high_snr_path, low_snr_path, 
           train_percent=0.8, 
           crop_box=crop_box,
-          epochs=50, 
-          batch_size=8,
-          learning_rate=1e-4,
+          epochs=40, 
+          batch_size=2,    # Smaller batch
+          learning_rate=1e-4,  # Smaller LR
           append=False)
 
     version_ = get_last_version()
